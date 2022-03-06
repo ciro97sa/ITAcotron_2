@@ -34,7 +34,7 @@ _, train_data = load_wav_data(args.data_path, 0)
 train_data = train_data[:args.num_samples]
 dataset = WaveGradDataset(ap=ap,
                           items=train_data,
-                          seq_len=ap.hop_length * 100,
+                          seq_len=-1,
                           hop_len=ap.hop_length,
                           pad_short=config.pad_short,
                           conv_pad=config.conv_pad,
@@ -58,12 +58,15 @@ if args.use_cuda:
     model.cuda()
 
 # setup optimization parameters
-base_values = sorted(np.random.uniform(high=10, size=args.search_depth))
+base_values = sorted(10 * np.random.uniform(size=args.search_depth))
+print(base_values)
+exponents = 10 ** np.linspace(-6, -1, num=args.num_iter)
 best_error = float('inf')
 best_schedule = None
 total_search_iter = len(base_values)**args.num_iter
 for base in tqdm(cartesian_product(base_values, repeat=args.num_iter), total=total_search_iter):
-    model.compute_noise_level(num_steps=args.num_iter, min_val=1e-6, max_val=1e-1, base_vals=base)
+    beta = exponents * base
+    model.compute_noise_level(beta)
     for data in loader:
         mel, audio = data
         y_hat = model.inference(mel.cuda() if args.use_cuda else mel)
@@ -78,11 +81,11 @@ for base in tqdm(cartesian_product(base_values, repeat=args.num_iter), total=tot
             mel_hat.append(torch.from_numpy(m))
 
         mel_hat = torch.stack(mel_hat)
-        mse = torch.sum((mel - mel_hat) ** 2)
+        mse = torch.sum((mel - mel_hat) ** 2).mean()
         if mse.item() < best_error:
             best_error = mse.item()
-            best_schedule = {'num_steps': args.num_iter, 'min_val':1e-6, 'max_val':1e-1, 'base_vals':base}
-            print(" > Found a better schedule.")
+            best_schedule = {'beta': beta}
+            print(f" > Found a better schedule. - MSE: {mse.item()}")
             np.save(args.output_path, best_schedule)
 
 

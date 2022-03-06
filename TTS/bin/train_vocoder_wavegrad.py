@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import traceback
+import numpy as np
 
 import torch
 # DISTRIBUTED
@@ -16,9 +17,8 @@ from TTS.utils.console_logger import ConsoleLogger
 from TTS.utils.distribute import init_distributed
 from TTS.utils.generic_utils import (KeepAverage, count_parameters,
                                      create_experiment_folder, get_git_branch,
-                                     remove_experiment_folder, set_init_dict,
-                                     set_amp_context)
-from TTS.utils.io import copy_config_file, load_config
+                                     remove_experiment_folder, set_init_dict)
+from TTS.utils.io import copy_model_files, load_config
 from TTS.utils.tensorboard_logger import TensorboardLogger
 from TTS.utils.training import setup_torch_training_env
 from TTS.vocoder.datasets.preprocess import load_wav_data, load_wav_feat_data
@@ -80,7 +80,7 @@ def format_test_data(data):
 
 
 def train(model, criterion, optimizer,
-          scheduler, ap, global_step, epoch):
+          scheduler, scaler, ap, global_step, epoch):
     data_loader = setup_loader(ap, is_val=False, verbose=(epoch == 0))
     model.train()
     epoch_time = 0
@@ -94,15 +94,11 @@ def train(model, criterion, optimizer,
     c_logger.print_train_start()
     # setup noise schedule
     noise_schedule = c['train_noise_schedule']
+    betas = np.linspace(noise_schedule['min_val'], noise_schedule['max_val'], noise_schedule['num_steps'])
     if hasattr(model, 'module'):
-        model.module.compute_noise_level(noise_schedule['num_steps'],
-                                         noise_schedule['min_val'],
-                                         noise_schedule['max_val'])
+        model.module.compute_noise_level(betas)
     else:
-        model.compute_noise_level(noise_schedule['num_steps'],
-                                  noise_schedule['min_val'],
-                                  noise_schedule['max_val'])
-    scaler = torch.cuda.amp.GradScaler() if c.mixed_precision else None
+        model.compute_noise_level(betas)
     for num_iter, data in enumerate(data_loader):
         start_time = time.time()
 
@@ -112,7 +108,7 @@ def train(model, criterion, optimizer,
 
         global_step += 1
 
-        with set_amp_context(c.mixed_precision):
+        with torch.cuda.amp.autocast(enabled=c.mixed_precision):
             # compute noisy input
             if hasattr(model, 'module'):
                 noise, x_noisy, noise_scale = model.module.compute_y_n(x)
@@ -208,7 +204,8 @@ def train(model, criterion, optimizer,
                                     global_step,
                                     epoch,
                                     OUT_PATH,
-                                    model_losses=loss_dict)
+                                    model_losses=loss_dict,
+                                    scaler=scaler.state_dict() if c.mixed_precision else None)
 
         end_time = time.time()
 
@@ -221,7 +218,7 @@ def train(model, criterion, optimizer,
     if args.rank == 0:
         tb_logger.tb_train_epoch_stats(global_step, epoch_stats)
     # TODO: plot model stats
-    if c.tb_model_param_stats:
+    if c.tb_model_param_stats and args.rank == 0:
         tb_logger.tb_model_weights(model, global_step)
     return keep_avg.avg_values, global_step
 
@@ -287,16 +284,13 @@ def evaluate(model, criterion, ap, global_step, epoch):
 
         # setup noise schedule and inference
         noise_schedule = c['test_noise_schedule']
+        betas = np.linspace(noise_schedule['min_val'], noise_schedule['max_val'], noise_schedule['num_steps'])
         if hasattr(model, 'module'):
-            model.module.compute_noise_level(noise_schedule['num_steps'],
-                                             noise_schedule['min_val'],
-                                             noise_schedule['max_val'])
+            model.module.compute_noise_level(betas)
             # compute voice
             x_pred = model.module.inference(m)
         else:
-            model.compute_noise_level(noise_schedule['num_steps'],
-                                      noise_schedule['min_val'],
-                                      noise_schedule['max_val'])
+            model.compute_noise_level(betas)
             # compute voice
             x_pred = model.inference(m)
 
@@ -336,6 +330,9 @@ def main(args):  # pylint: disable=redefined-outer-name
     # setup models
     model = setup_generator(c)
 
+    # scaler for mixed_precision
+    scaler = torch.cuda.amp.GradScaler() if c.mixed_precision else None
+
     # setup optimizers
     optimizer = Adam(model.parameters(), lr=c.lr, weight_decay=0)
 
@@ -360,6 +357,9 @@ def main(args):  # pylint: disable=redefined-outer-name
                 scheduler.load_state_dict(checkpoint['scheduler'])
                 # NOTE: Not sure if necessary
                 scheduler.optimizer = optimizer
+            if "scaler" in checkpoint and c.mixed_precision:
+                print(" > Restoring AMP Scaler...")
+                scaler.load_state_dict(checkpoint["scaler"])
         except RuntimeError:
             # retore only matching layers.
             print(" > Partial model initialization...")
@@ -396,7 +396,7 @@ def main(args):  # pylint: disable=redefined-outer-name
     for epoch in range(0, c.epochs):
         c_logger.print_epoch_start(epoch, c.epochs)
         _, global_step = train(model, criterion, optimizer,
-                               scheduler, ap, global_step,
+                               scheduler, scaler, ap, global_step,
                                epoch)
         eval_avg_loss_dict = evaluate(model, criterion, ap,
                                       global_step, epoch)
@@ -413,7 +413,8 @@ def main(args):  # pylint: disable=redefined-outer-name
                                     global_step,
                                     epoch,
                                     OUT_PATH,
-                                    model_losses=eval_avg_loss_dict)
+                                    model_losses=eval_avg_loss_dict,
+                                    scaler=scaler.state_dict() if c.mixed_precision else None)
 
 
 if __name__ == '__main__':
@@ -485,8 +486,8 @@ if __name__ == '__main__':
         if args.restore_path:
             new_fields["restore_path"] = args.restore_path
         new_fields["github_branch"] = get_git_branch()
-        copy_config_file(args.config_path,
-                         os.path.join(OUT_PATH, 'config.json'), new_fields)
+        copy_model_files(c,  args.config_path,
+                         OUT_PATH, new_fields)
         os.chmod(AUDIO_PATH, 0o775)
         os.chmod(OUT_PATH, 0o775)
 

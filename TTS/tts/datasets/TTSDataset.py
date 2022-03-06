@@ -1,7 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-
 import collections
 import os
 import random
@@ -15,6 +11,7 @@ from TTS.tts.utils.data import (prepare_data, prepare_stop_target,
                                 prepare_tensor)
 from TTS.tts.utils.text import (pad_with_eos_bos, phoneme_to_sequence,
                                 text_to_sequence)
+
 
 class MyDataset(Dataset):
     def __init__(self,
@@ -30,7 +27,7 @@ class MyDataset(Dataset):
                  max_seq_len=float("inf"),
                  use_phonemes=True,
                  phoneme_cache_path=None,
-                 phoneme_language="it",
+                 phoneme_language="en-us",
                  enable_eos_bos=False,
                  speaker_mapping=None,
                  use_noise_augment=False,
@@ -38,6 +35,7 @@ class MyDataset(Dataset):
         """
         Args:
             outputs_per_step (int): number of time frames predicted per step.
+            text_cleaner (str): text cleaner used for the dataset.
             compute_linear_spec (bool): compute linear spectrogram if True.
             ap (TTS.tts.utils.AudioProcessor): audio processor object.
             meta_data (list): list of dataset instances.
@@ -83,7 +81,7 @@ class MyDataset(Dataset):
             print(" | > Number of instances : {}".format(len(self.items)))
 
     def load_wav(self, filename):
-        audio = self.ap.load_wav(filename, sr=self.sample_rate)
+        audio = self.ap.load_wav(filename)
         return audio
 
     @staticmethod
@@ -97,7 +95,10 @@ class MyDataset(Dataset):
         since the usage is for subsequent caching, we never add bos and
         eos chars here. Instead we add those dynamically later; based on the
         config option."""
-        phonemes = phoneme_to_sequence(text, [cleaners], language=language, enable_eos_bos=False, tp=tp, add_blank=add_blank)
+        phonemes = phoneme_to_sequence(text, [cleaners],
+                                       language=language,
+                                       enable_eos_bos=False,
+                                       tp=tp, add_blank=add_blank)
         phonemes = np.asarray(phonemes, dtype=np.int32)
         np.save(cache_path, phonemes)
         return phonemes
@@ -108,7 +109,8 @@ class MyDataset(Dataset):
 
         # different names for normal phonemes and with blank chars.
         file_name_ext = '_blanked_phoneme.npy' if add_blank else '_phoneme.npy'
-        cache_path = os.path.join(phoneme_cache_path, file_name + file_name_ext)
+        cache_path = os.path.join(phoneme_cache_path,
+                                  file_name + file_name_ext)
         try:
             phonemes = np.load(cache_path)
         except FileNotFoundError:
@@ -144,7 +146,9 @@ class MyDataset(Dataset):
                 text = self._load_or_generate_phoneme_sequence(wav_file, text, self.phoneme_cache_path, self.enable_eos_bos, self.cleaners, self.phoneme_language, self.tp, self.add_blank)
 
             else:
-                text = np.asarray(text_to_sequence(text, [self.cleaners], tp=self.tp, add_blank=self.add_blank), dtype=np.int32)
+                text = np.asarray(text_to_sequence(text, [self.cleaners],
+                                                tp=self.tp, add_blank=self.add_blank),
+                              dtype=np.int32)
 
         assert text.size > 0, self.items[idx][1]
         assert wav.size > 0, self.items[idx][1]
@@ -184,11 +188,12 @@ class MyDataset(Dataset):
                 print(" | > Computing input sequences ...")
             for idx, item in enumerate(tqdm.tqdm(self.items)):
                 text, *_ = item
-                sequence = np.asarray(text_to_sequence(text, [self.cleaners], tp=self.tp, add_blank=self.add_blank),dtype=np.int32)
+                sequence = np.asarray(text_to_sequence(text, [self.cleaners],
+                                               tp=self.tp, add_blank=self.add_blank),
+                              dtype=np.int32)
                 self.items[idx][0] = sequence
 
         else:
-            
             func_args = [self.phoneme_cache_path, self.enable_eos_bos, self.cleaners, self.phoneme_language, self.tp, self.add_blank]
             if self.verbose:
                 print(" | > Computing phonemes ...")
@@ -259,15 +264,24 @@ class MyDataset(Dataset):
                 torch.LongTensor(text_lenghts), dim=0, descending=True)
 
             wav = [batch[idx]['wav'] for idx in ids_sorted_decreasing]
-            item_idxs = [batch[idx]['item_idx'] for idx in ids_sorted_decreasing]
+            item_idxs = [
+                batch[idx]['item_idx'] for idx in ids_sorted_decreasing
+            ]
             text = [batch[idx]['text'] for idx in ids_sorted_decreasing]
 
-            speaker_name = [batch[idx]['speaker_name'] for idx in ids_sorted_decreasing]
+            speaker_name = [
+                batch[idx]['speaker_name'] for idx in ids_sorted_decreasing
+            ]
             # get speaker embeddings
-            
             if self.speaker_mapping is not None:
-                wav_files_names = [batch[idx]['wav_file_name']for idx in ids_sorted_decreasing]
-                speaker_embedding = [self.speaker_mapping[w]['embedding']for w in wav_files_names]
+                wav_files_names = [
+                    batch[idx]['wav_file_name']
+                    for idx in ids_sorted_decreasing
+                ]
+                speaker_embedding = [
+                    self.speaker_mapping[w]['embedding']
+                    for w in wav_files_names
+                ]
             else:
                 speaker_embedding = None
             # compute features
@@ -276,7 +290,10 @@ class MyDataset(Dataset):
             mel_lengths = [m.shape[1] for m in mel]
 
             # compute 'stop token' targets
-            stop_targets = [np.array([0.] * (mel_len - 1) + [1.])for mel_len in mel_lengths]
+            stop_targets = [
+                np.array([0.] * (mel_len - 1) + [1.])
+                for mel_len in mel_lengths
+            ]
 
             # PAD stop targets
             stop_targets = prepare_stop_target(stop_targets,
@@ -303,7 +320,9 @@ class MyDataset(Dataset):
 
             # compute linear spectrogram
             if self.compute_linear_spec:
-                linear = [self.ap.spectrogram(w).astype('float32') for w in wav]
+                linear = [
+                    self.ap.spectrogram(w).astype('float32') for w in wav
+                ]
                 linear = prepare_tensor(linear, self.outputs_per_step)
                 linear = linear.transpose(0, 2, 1)
                 assert mel.shape[1] == linear.shape[1]
@@ -323,6 +342,8 @@ class MyDataset(Dataset):
                 attns = torch.FloatTensor(attns).unsqueeze(1)
             else:
                 attns = None
-            return text, text_lenghts, speaker_name, linear, mel, mel_lengths, stop_targets, item_idxs, speaker_embedding, attns
+            return text, text_lenghts, speaker_name, linear, mel, mel_lengths, \
+                   stop_targets, item_idxs, speaker_embedding, attns
 
-        raise TypeError(("batch must contain tensors, numbers, dicts or lists; found {}".format(type(batch[0]))))
+        raise TypeError(("batch must contain tensors, numbers, dicts or lists;\
+                         found {}".format(type(batch[0]))))

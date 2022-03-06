@@ -79,8 +79,8 @@ class Wavegrad(nn.Module):
         return x
 
     def load_noise_schedule(self, path):
-        sched = np.load(path, allow_pickle=True).item()
-        self.compute_noise_level(**sched)
+        beta = np.load(path, allow_pickle=True).item()['beta']
+        self.compute_noise_level(beta)
 
     @torch.no_grad()
     def inference(self, x, y_n=None):
@@ -105,24 +105,22 @@ class Wavegrad(nn.Module):
         self.noise_level = self.noise_level.to(y_0)
         if len(y_0.shape) == 3:
             y_0 = y_0.squeeze(1)
-        s = torch.randint(1, self.num_steps + 1, [y_0.shape[0]])
-        l_a, l_b = self.noise_level[s-1], self.noise_level[s]
+        s = torch.randint(0, self.num_steps - 1, [y_0.shape[0]])
+        l_a, l_b = self.noise_level[s], self.noise_level[s+1]
         noise_scale = l_a + torch.rand(y_0.shape[0]).to(y_0) * (l_b - l_a)
         noise_scale = noise_scale.unsqueeze(1)
         noise = torch.randn_like(y_0)
         noisy_audio = noise_scale * y_0 + (1.0 - noise_scale**2)**0.5 * noise
         return noise.unsqueeze(1), noisy_audio.unsqueeze(1), noise_scale[:, 0]
 
-    def compute_noise_level(self, num_steps, min_val, max_val, base_vals=None):
+    def compute_noise_level(self, beta):
         """Compute noise schedule parameters"""
-        beta = np.linspace(min_val, max_val, num_steps)
-        if base_vals is not None:
-            beta *= base_vals
+        self.num_steps = len(beta)
         alpha = 1 - beta
         alpha_hat = np.cumprod(alpha)
         noise_level = np.concatenate([[1.0], alpha_hat ** 0.5], axis=0)
+        noise_level = alpha_hat ** 0.5
 
-        self.num_steps = num_steps
         # pylint: disable=not-callable
         self.beta = torch.tensor(beta.astype(np.float32))
         self.alpha = torch.tensor(alpha.astype(np.float32))
@@ -177,3 +175,22 @@ class Wavegrad(nn.Module):
         self.x_conv = weight_norm(self.x_conv)
         self.out_conv = weight_norm(self.out_conv)
         self.y_conv = weight_norm(self.y_conv)
+
+
+    def load_checkpoint(self, config, checkpoint_path, eval=False):  # pylint: disable=unused-argument, redefined-builtin
+        state = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+        self.load_state_dict(state['model'])
+        if eval:
+            self.eval()
+            assert not self.training
+            if self.use_weight_norm:
+                self.remove_weight_norm()
+            betas = np.linspace(config['test_noise_schedule']['min_val'],
+                                config['test_noise_schedule']['max_val'],
+                                config['test_noise_schedule']['num_steps'])
+            self.compute_noise_level(betas)
+        else:
+            betas = np.linspace(config['train_noise_schedule']['min_val'],
+                                config['train_noise_schedule']['max_val'],
+                                config['train_noise_schedule']['num_steps'])
+            self.compute_noise_level(betas)

@@ -260,19 +260,23 @@ class WaveRNN(nn.Module):
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
-    def generate(self, mels, batched, target, overlap, use_cuda=False):
+    def inference(self, mels, batched, target, overlap):
 
         self.eval()
-        device = 'cuda' if use_cuda else 'cpu'
+        device = mels.device
         output = []
         start = time.time()
         rnn1 = self.get_gru_cell(self.rnn1)
         rnn2 = self.get_gru_cell(self.rnn2)
 
         with torch.no_grad():
-            mels = torch.FloatTensor(mels).unsqueeze(0).to(device)
-            #mels = torch.FloatTensor(mels).cuda().unsqueeze(0)
+            if isinstance(mels, np.ndarray):
+                mels = torch.FloatTensor(mels).to(device)
+
+            if mels.ndim == 2:
+                mels = mels.unsqueeze(0)
             wave_len = (mels.size(-1) - 1) * self.hop_length
+
             mels = self.pad_tensor(mels.transpose(
                 1, 2), pad=self.pad, side="both")
             mels, aux = self.upsample(mels.transpose(1, 2))
@@ -495,3 +499,10 @@ class WaveRNN(nn.Module):
             unfolded[start:end] += y[i]
 
         return unfolded
+
+    def load_checkpoint(self, config, checkpoint_path, eval=False):  # pylint: disable=unused-argument, redefined-builtin
+        state = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+        self.load_state_dict(state['model'])
+        if eval:
+            self.eval()
+            assert not self.training

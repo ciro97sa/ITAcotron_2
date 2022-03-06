@@ -13,15 +13,14 @@ from TTS.speaker_encoder.dataset import MyDataset
 from TTS.speaker_encoder.losses import AngleProtoLoss, GE2ELoss
 from TTS.speaker_encoder.model import SpeakerEncoder
 from TTS.speaker_encoder.utils.generic_utils import \
-    check_config_speaker_encoder
+    check_config_speaker_encoder, save_best_model
 from TTS.speaker_encoder.utils.visual import plot_embeddings
 from TTS.tts.datasets.preprocess import load_meta_data
-from TTS.tts.utils.io import save_best_model
 from TTS.utils.audio import AudioProcessor
 from TTS.utils.generic_utils import (count_parameters,
                                      create_experiment_folder, get_git_branch,
                                      remove_experiment_folder, set_init_dict)
-from TTS.utils.io import copy_config_file, load_config
+from TTS.utils.io import copy_model_files, load_config
 from TTS.utils.radam import RAdam
 from TTS.utils.tensorboard_logger import TensorboardLogger
 from TTS.utils.training import NoamLR, check_update
@@ -35,7 +34,7 @@ print(" > Using CUDA: ", use_cuda)
 print(" > Number of GPUs: ", num_gpus)
 
 
-def setup_loader(ap, is_val=False, verbose=False):
+def setup_loader(ap: AudioProcessor, is_val: bool=False, verbose: bool=False):
     if is_val:
         loader = None
     else:
@@ -212,6 +211,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--config_path',
         type=str,
+        required=True,
         help='Path to config file for training.',
     )
     parser.add_argument('--debug',
@@ -254,7 +254,7 @@ if __name__ == '__main__':
     if args.restore_path:
         new_fields["restore_path"] = args.restore_path
     new_fields["github_branch"] = get_git_branch()
-    copy_config_file(args.config_path, os.path.join(OUT_PATH, 'config.json'),
+    copy_model_files(c,  args.config_path, OUT_PATH,
                      new_fields)
 
     LOG_DIR = OUT_PATH

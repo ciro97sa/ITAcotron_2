@@ -3,7 +3,7 @@ import soundfile as sf
 import numpy as np
 import scipy.io.wavfile
 import scipy.signal
-import pyworld as pw
+# import pyworld as pw
 
 from TTS.tts.utils.data import StandardScaler
 
@@ -11,6 +11,7 @@ from TTS.tts.utils.data import StandardScaler
 class AudioProcessor(object):
     def __init__(self,
                  sample_rate=None,
+                 resample=False,
                  num_mels=None,
                  min_level_db=None,
                  frame_shift_ms=None,
@@ -34,11 +35,12 @@ class AudioProcessor(object):
                  trim_db=60,
                  do_sound_norm=False,
                  stats_path=None,
+                 verbose=True,
                  **_):
 
-        print(" > Setting up Audio Processor...")
         # setup class attributed
         self.sample_rate = sample_rate
+        self.resample = resample
         self.num_mels = num_mels
         self.min_level_db = min_level_db or 0
         self.frame_shift_ms = frame_shift_ms
@@ -71,8 +73,10 @@ class AudioProcessor(object):
         assert min_level_db != 0.0, " [!] min_level_db is 0"
         assert self.win_length <= self.fft_size, " [!] win_length cannot be larger than fft_size"
         members = vars(self)
-        for key, value in members.items():
-            print(" | > {}:{}".format(key, value))
+        if verbose:
+            print(" > Setting up Audio Processor...")
+            for key, value in members.items():
+                print(" | > {}:{}".format(key, value))
         # create spectrogram utils
         self.mel_basis = self._build_mel_basis()
         self.inv_mel_basis = np.linalg.pinv(self._build_mel_basis())
@@ -105,7 +109,7 @@ class AudioProcessor(object):
         return hop_length, win_length
 
     ### normalization ###
-    def _normalize(self, S):
+    def normalize(self, S):
         """Put values in [0, self.max_norm] or [-self.max_norm, self.max_norm]"""
         #pylint: disable=no-else-return
         S = S.copy()
@@ -134,7 +138,7 @@ class AudioProcessor(object):
         else:
             return S
 
-    def _denormalize(self, S):
+    def denormalize(self, S):
         """denormalize values"""
         #pylint: disable=no-else-return
         S_denorm = S.copy()
@@ -219,7 +223,7 @@ class AudioProcessor(object):
         else:
             D = self._stft(y)
         S = self._amp_to_db(np.abs(D))
-        return self._normalize(S)
+        return self.normalize(S)
 
     def melspectrogram(self, y):
         if self.preemphasis != 0:
@@ -227,11 +231,11 @@ class AudioProcessor(object):
         else:
             D = self._stft(y)
         S = self._amp_to_db(self._linear_to_mel(np.abs(D)))
-        return self._normalize(S)
+        return self.normalize(S)
 
     def inv_spectrogram(self, spectrogram):
         """Converts spectrogram to waveform using librosa"""
-        S = self._denormalize(spectrogram)
+        S = self.denormalize(spectrogram)
         S = self._db_to_amp(S)
         # Reconstruct phase
         if self.preemphasis != 0:
@@ -240,7 +244,7 @@ class AudioProcessor(object):
 
     def inv_melspectrogram(self, mel_spectrogram):
         '''Converts melspectrogram to waveform using librosa'''
-        D = self._denormalize(mel_spectrogram)
+        D = self.denormalize(mel_spectrogram)
         S = self._db_to_amp(D)
         S = self._mel_to_linear(S)  # Convert back to linear
         if self.preemphasis != 0:
@@ -248,11 +252,11 @@ class AudioProcessor(object):
         return self._griffin_lim(S**self.power)
 
     def out_linear_to_mel(self, linear_spec):
-        S = self._denormalize(linear_spec)
+        S = self.denormalize(linear_spec)
         S = self._db_to_amp(S)
         S = self._linear_to_mel(np.abs(S))
         S = self._amp_to_db(S)
-        mel = self._normalize(S)
+        mel = self.normalize(S)
         return mel
 
     ### STFT and ISTFT ###
@@ -288,15 +292,15 @@ class AudioProcessor(object):
         return pad // 2, pad // 2 + pad % 2
 
     ### Compute F0 ###
-    def compute_f0(self, x):
-        f0, t = pw.dio(
-            x.astype(np.double),
-            fs=self.sample_rate,
-            f0_ceil=self.mel_fmax,
-            frame_period=1000 * self.hop_length / self.sample_rate,
-        )
-        f0 = pw.stonemask(x.astype(np.double), f0, t, self.sample_rate)
-        return f0
+    # def compute_f0(self, x):
+    #     f0, t = pw.dio(
+    #         x.astype(np.double),
+    #         fs=self.sample_rate,
+    #         f0_ceil=self.mel_fmax,
+    #         frame_period=1000 * self.hop_length / self.sample_rate,
+    #     )
+    #     f0 = pw.stonemask(x.astype(np.double), f0, t, self.sample_rate)
+    #     return f0
 
     ### Audio Processing ###
     def find_endpoint(self, wav, threshold_db=-40, min_silence_sec=0.8):
@@ -321,7 +325,9 @@ class AudioProcessor(object):
 
     ### save and load ###
     def load_wav(self, filename, sr=None):
-        if sr is None:
+        if self.resample:
+            x, sr = librosa.load(filename, sr=self.sample_rate)
+        elif sr is None:
             x, sr = sf.read(filename)
             assert self.sample_rate == sr, "%s vs %s"%(self.sample_rate, sr)
         else:

@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import sys
-sys.path.append(r"/home/arcslab/Documents/Anna_Favaro/TTS")
-sys.path.append(r"/home/arcslab/Documents/Anna_Favaro/TTS/TTS")
-
 import argparse
 import glob
 import os
-
+import sys
 import time
 import traceback
 from random import randrange
@@ -22,9 +18,9 @@ from TTS.tts.layers.losses import TacotronLoss
 from TTS.tts.utils.generic_utils import check_config_tts, setup_model
 from TTS.tts.utils.io import save_best_model, save_checkpoint
 from TTS.tts.utils.measures import alignment_diagonal_score
-from TTS.tts.utils.speakers import load_speaker_mapping, parse_speakers
+from TTS.tts.utils.speakers import parse_speakers
 from TTS.tts.utils.synthesis import synthesis
-from TTS.tts.utils.text.symbols import make_symbols
+from TTS.tts.utils.text.symbols import make_symbols, phonemes, symbols
 from TTS.tts.utils.visual import plot_alignment, plot_spectrogram
 from TTS.utils.audio import AudioProcessor
 from TTS.utils.console_logger import ConsoleLogger
@@ -33,7 +29,7 @@ from TTS.utils.distribute import (DistributedSampler, apply_gradient_allreduce,
 from TTS.utils.generic_utils import (KeepAverage, count_parameters,
                                      create_experiment_folder, get_git_branch,
                                      remove_experiment_folder, set_init_dict)
-from TTS.utils.io import copy_config_file, load_config
+from TTS.utils.io import copy_model_files, load_config
 from TTS.utils.radam import RAdam
 from TTS.utils.tensorboard_logger import TensorboardLogger
 from TTS.utils.training import (NoamLR, adam_weight_decay, check_update,
@@ -43,28 +39,35 @@ from TTS.utils.training import (NoamLR, adam_weight_decay, check_update,
 use_cuda, num_gpus = setup_torch_training_env(True, False)
 
 
-def setup_loader(ap, r, is_val=False, verbose=False, speaker_mapping=None):
+def setup_loader(ap, r, is_val=False, verbose=False, dataset=None):
     if is_val and not c.run_eval:
         loader = None
     else:
-        dataset = MyDataset(
-            r,
-            c.text_cleaner,
-            compute_linear_spec=c.model.lower() == 'tacotron',
-            meta_data=meta_data_eval if is_val else meta_data_train,
-            ap=ap,
-            tp=c.characters if 'characters' in c.keys() else None,
-            add_blank=c['add_blank'] if 'add_blank' in c.keys() else False,
-            batch_group_size=0 if is_val else c.batch_group_size *
-            c.batch_size,
-            min_seq_len=c.min_seq_len,
-            max_seq_len=c.max_seq_len,
-            phoneme_cache_path=c.phoneme_cache_path,
-            use_phonemes=c.use_phonemes,
-            phoneme_language=c.phoneme_language,
-            enable_eos_bos=c.enable_eos_bos_chars,
-            verbose=verbose,
-            speaker_mapping=speaker_mapping if c.use_speaker_embedding and c.use_external_speaker_embedding_file else None)
+        if dataset is None:
+            dataset = MyDataset(
+                r,
+                c.text_cleaner,
+                compute_linear_spec=c.model.lower() == 'tacotron',
+                meta_data=meta_data_eval if is_val else meta_data_train,
+                ap=ap,
+                tp=c.characters if 'characters' in c.keys() else None,
+                add_blank=c['add_blank'] if 'add_blank' in c.keys() else False,
+                batch_group_size=0 if is_val else c.batch_group_size *
+                c.batch_size,
+                min_seq_len=c.min_seq_len,
+                max_seq_len=c.max_seq_len,
+                phoneme_cache_path=c.phoneme_cache_path,
+                use_phonemes=c.use_phonemes,
+                phoneme_language=c.phoneme_language,
+                enable_eos_bos=c.enable_eos_bos_chars,
+                verbose=verbose,
+                speaker_mapping=speaker_mapping if c.use_speaker_embedding and c.use_external_speaker_embedding_file else None)
+
+            if c.use_phonemes and c.compute_input_seq_cache:
+                # precompute phonemes to have a better estimate of sequence lengths.
+                dataset.compute_input_seq(c.num_loader_workers)
+            dataset.sort_items()
+
         sampler = DistributedSampler(dataset) if num_gpus > 1 else None
         loader = DataLoader(
             dataset,
@@ -78,10 +81,7 @@ def setup_loader(ap, r, is_val=False, verbose=False, speaker_mapping=None):
             pin_memory=False)
     return loader
 
-def format_data(data, speaker_mapping=None):
-    if speaker_mapping is None and c.use_speaker_embedding and not c.use_external_speaker_embedding_file:
-        speaker_mapping = load_speaker_mapping(OUT_PATH)
-
+def format_data(data):
     # setup input data
     text_input = data[0]
     text_lengths = data[1]
@@ -90,8 +90,8 @@ def format_data(data, speaker_mapping=None):
     mel_input = data[4]
     mel_lengths = data[5]
     stop_targets = data[6]
-    avg_text_length = torch.mean(text_lengths.float())
-    avg_spec_length = torch.mean(mel_lengths.float())
+    max_text_length = torch.max(text_lengths.float())
+    max_spec_length = torch.max(mel_lengths.float())
 
     if c.use_speaker_embedding:
         if c.use_external_speaker_embedding_file:
@@ -127,13 +127,11 @@ def format_data(data, speaker_mapping=None):
         if speaker_embeddings is not None:
             speaker_embeddings = speaker_embeddings.cuda(non_blocking=True)
 
-    return text_input, text_lengths, mel_input, mel_lengths, linear_input, stop_targets, speaker_ids, speaker_embeddings, avg_text_length, avg_spec_length
+    return text_input, text_lengths, mel_input, mel_lengths, linear_input, stop_targets, speaker_ids, speaker_embeddings, max_text_length, max_spec_length
 
 
-def train(model, criterion, optimizer, optimizer_st, scheduler,
-          ap, global_step, epoch, amp, speaker_mapping=None):
-    data_loader = setup_loader(ap, model.decoder.r, is_val=False,
-                               verbose=(epoch == 0), speaker_mapping=speaker_mapping)
+def train(data_loader, model, criterion, optimizer, optimizer_st, scheduler,
+          ap, global_step, epoch, scaler, scaler_st):
     model.train()
     epoch_time = 0
     keep_avg = KeepAverage()
@@ -148,7 +146,7 @@ def train(model, criterion, optimizer, optimizer_st, scheduler,
         start_time = time.time()
 
         # format data
-        text_input, text_lengths, mel_input, mel_lengths, linear_input, stop_targets, speaker_ids, speaker_embeddings, avg_text_length, avg_spec_length = format_data(data, speaker_mapping)
+        text_input, text_lengths, mel_input, mel_lengths, linear_input, stop_targets, speaker_ids, speaker_embeddings, max_text_length, max_spec_length = format_data(data)
         loader_time = time.time() - end_time
 
         global_step += 1
@@ -156,64 +154,78 @@ def train(model, criterion, optimizer, optimizer_st, scheduler,
         # setup lr
         if c.noam_schedule:
             scheduler.step()
+
         optimizer.zero_grad()
         if optimizer_st:
             optimizer_st.zero_grad()
 
-        # forward pass model
-        if c.bidirectional_decoder or c.double_decoder_consistency:
-            decoder_output, postnet_output, alignments, stop_tokens, decoder_backward_output, alignments_backward = model(
-                text_input, text_lengths, mel_input, mel_lengths, speaker_ids=speaker_ids, speaker_embeddings=speaker_embeddings)
-        else:
-            decoder_output, postnet_output, alignments, stop_tokens = model(
-                text_input, text_lengths, mel_input, mel_lengths, speaker_ids=speaker_ids, speaker_embeddings=speaker_embeddings)
-            decoder_backward_output = None
-            alignments_backward = None
+        with torch.cuda.amp.autocast(enabled=c.mixed_precision):
+            # forward pass model
+            if c.bidirectional_decoder or c.double_decoder_consistency:
+                decoder_output, postnet_output, alignments, stop_tokens, decoder_backward_output, alignments_backward = model(
+                    text_input, text_lengths, mel_input, mel_lengths, speaker_ids=speaker_ids, speaker_embeddings=speaker_embeddings)
+            else:
+                decoder_output, postnet_output, alignments, stop_tokens = model(
+                    text_input, text_lengths, mel_input, mel_lengths, speaker_ids=speaker_ids, speaker_embeddings=speaker_embeddings)
+                decoder_backward_output = None
+                alignments_backward = None
 
-        # set the [alignment] lengths wrt reduction factor for guided attention
-        if mel_lengths.max() % model.decoder.r != 0:
-            alignment_lengths = (mel_lengths + (model.decoder.r - (mel_lengths.max() % model.decoder.r))) // model.decoder.r
-        else:
-            alignment_lengths = mel_lengths //  model.decoder.r
+            # set the [alignment] lengths wrt reduction factor for guided attention
+            if mel_lengths.max() % model.decoder.r != 0:
+                alignment_lengths = (mel_lengths + (model.decoder.r - (mel_lengths.max() % model.decoder.r))) // model.decoder.r
+            else:
+                alignment_lengths = mel_lengths //  model.decoder.r
 
-        # compute loss
-        loss_dict = criterion(postnet_output, decoder_output, mel_input,
-                              linear_input, stop_tokens, stop_targets,
-                              mel_lengths, decoder_backward_output,
-                              alignments, alignment_lengths, alignments_backward,
-                              text_lengths)
+            # compute loss
+            loss_dict = criterion(postnet_output, decoder_output, mel_input,
+                                linear_input, stop_tokens, stop_targets,
+                                mel_lengths, decoder_backward_output,
+                                alignments, alignment_lengths, alignments_backward,
+                                text_lengths)
 
-        # backward pass
-        if amp is not None:
-            with amp.scale_loss(loss_dict['loss'], optimizer) as scaled_loss:
-                scaled_loss.backward()
+        # check nan loss
+        if torch.isnan(loss_dict['loss']).any():
+            raise RuntimeError(f'Detected NaN loss at step {global_step}.')
+
+        # optimizer step
+        if c.mixed_precision:
+            # model optimizer step in mixed precision mode
+            scaler.scale(loss_dict['loss']).backward()
+            scaler.unscale_(optimizer)
+            optimizer, current_lr = adam_weight_decay(optimizer)
+            grad_norm, _ = check_update(model, c.grad_clip, ignore_stopnet=True)
+            scaler.step(optimizer)
+            scaler.update()
+
+            # stopnet optimizer step
+            if c.separate_stopnet:
+                scaler_st.scale( loss_dict['stopnet_loss']).backward()
+                scaler.unscale_(optimizer_st)
+                optimizer_st, _ = adam_weight_decay(optimizer_st)
+                grad_norm_st, _ = check_update(model.decoder.stopnet, 1.0)
+                scaler_st.step(optimizer)
+                scaler_st.update()
+            else:
+                grad_norm_st = 0
         else:
+            # main model optimizer step
             loss_dict['loss'].backward()
+            optimizer, current_lr = adam_weight_decay(optimizer)
+            grad_norm, _ = check_update(model, c.grad_clip, ignore_stopnet=True)
+            optimizer.step()
 
-        optimizer, current_lr = adam_weight_decay(optimizer)
-        if amp:
-            amp_opt_params = amp.master_params(optimizer)
-        else:
-            amp_opt_params = None
-        grad_norm, _ = check_update(model, c.grad_clip, ignore_stopnet=True, amp_opt_params=amp_opt_params)
-        optimizer.step()
+            # stopnet optimizer step
+            if c.separate_stopnet:
+                loss_dict['stopnet_loss'].backward()
+                optimizer_st, _ = adam_weight_decay(optimizer_st)
+                grad_norm_st, _ = check_update(model.decoder.stopnet, 1.0)
+                optimizer_st.step()
+            else:
+                grad_norm_st = 0
 
         # compute alignment error (the lower the better )
         align_error = 1 - alignment_diagonal_score(alignments)
         loss_dict['align_error'] = align_error
-
-        # backpass and check the grad norm for stop loss
-        if c.separate_stopnet:
-            loss_dict['stopnet_loss'].backward()
-            optimizer_st, _ = adam_weight_decay(optimizer_st)
-            if amp:
-                amp_opt_params = amp.master_params(optimizer)
-            else:
-                amp_opt_params = None
-            grad_norm_st, _ = check_update(model.decoder.stopnet, 1.0, amp_opt_params=amp_opt_params)
-            optimizer_st.step()
-        else:
-            grad_norm_st = 0
 
         step_time = time.time() - start_time
         epoch_time += step_time
@@ -245,8 +257,8 @@ def train(model, criterion, optimizer, optimizer_st, scheduler,
         # print training progress
         if global_step % c.print_step == 0:
             log_dict = {
-                "avg_spec_length": [avg_spec_length, 1],  # value, precision
-                "avg_text_length": [avg_text_length, 1],
+                "max_spec_length": [max_spec_length, 1],  # value, precision
+                "max_text_length": [max_text_length, 1],
                 "step_time": [step_time, 4],
                 "loader_time": [loader_time, 2],
                 "current_lr": current_lr,
@@ -273,7 +285,7 @@ def train(model, criterion, optimizer, optimizer_st, scheduler,
                     save_checkpoint(model, optimizer, global_step, epoch, model.decoder.r, OUT_PATH,
                                     optimizer_st=optimizer_st,
                                     model_loss=loss_dict['postnet_loss'],
-                                    amp_state_dict=amp.state_dict() if amp else None)
+                                    scaler=scaler.state_dict() if c.mixed_precision else None)
 
                 # Diagnostic visualizations
                 const_spec = postnet_output[0].data.cpu().numpy()
@@ -317,8 +329,7 @@ def train(model, criterion, optimizer, optimizer_st, scheduler,
 
 
 @torch.no_grad()
-def evaluate(model, criterion, ap, global_step, epoch, speaker_mapping=None):
-    data_loader = setup_loader(ap, model.decoder.r, is_val=True, speaker_mapping=speaker_mapping)
+def evaluate(data_loader, model, criterion, ap, global_step, epoch):
     model.eval()
     epoch_time = 0
     keep_avg = KeepAverage()
@@ -328,7 +339,7 @@ def evaluate(model, criterion, ap, global_step, epoch, speaker_mapping=None):
             start_time = time.time()
 
             # format data
-            text_input, text_lengths, mel_input, mel_lengths, linear_input, stop_targets, speaker_ids, speaker_embeddings, _, _ = format_data(data, speaker_mapping)
+            text_input, text_lengths, mel_input, mel_lengths, linear_input, stop_targets, speaker_ids, speaker_embeddings, _, _ = format_data(data)
             assert mel_input.shape[1] % model.decoder.r == 0
 
             # forward pass model
@@ -421,10 +432,8 @@ def evaluate(model, criterion, ap, global_step, epoch, speaker_mapping=None):
     if args.rank == 0 and epoch > c.test_delay_epochs:
         if c.test_sentences_file is None:
             test_sentences = [
-                "Finalmente ho sviluppato una voce tutta mia.",
-                "Oggi è proprio una bella giornata nonostante la pioggia.",
-                "Questa torta è deliziosa perchè è dolce."
-
+                "Ciao ragazzi, sono il professore Sansone.",
+                "Voglio illustrarvi un magico mondo."
             ]
         else:
             with open(c.test_sentences_file, "r") as f:
@@ -482,7 +491,7 @@ def evaluate(model, criterion, ap, global_step, epoch, speaker_mapping=None):
 # FIXME: move args definition/parsing inside of main?
 def main(args):  # pylint: disable=redefined-outer-name
     # pylint: disable=global-variable-undefined
-    global meta_data_train, meta_data_eval, symbols, phonemes
+    global meta_data_train, meta_data_eval, symbols, phonemes, speaker_mapping
     # Audio processor
     ap = AudioProcessor(**c.audio)
     if 'characters' in c.keys():
@@ -508,6 +517,10 @@ def main(args):  # pylint: disable=redefined-outer-name
 
     model = setup_model(num_chars, num_speakers, c, speaker_embedding_dim)
 
+    # scalers for mixed precision training
+    scaler = torch.cuda.amp.GradScaler() if c.mixed_precision else None
+    scaler_st = torch.cuda.amp.GradScaler() if c.mixed_precision and c.separate_stopnet else None
+
     params = set_weight_decay(model, c.wd)
     optimizer = RAdam(params, lr=c.lr, weight_decay=0)
     if c.stopnet and c.separate_stopnet:
@@ -517,27 +530,23 @@ def main(args):  # pylint: disable=redefined-outer-name
     else:
         optimizer_st = None
 
-    if c.apex_amp_level == "O1":
-        # pylint: disable=import-outside-toplevel
-        from apex import amp
-        model.cuda()
-        model, optimizer = amp.initialize(model, optimizer, opt_level=c.apex_amp_level)
-    else:
-        amp = None
-
     # setup criterion
     criterion = TacotronLoss(c, stopnet_pos_weight=10.0, ga_sigma=0.4)
 
     if args.restore_path:
         checkpoint = torch.load(args.restore_path, map_location='cpu')
         try:
-            # TODO: fix optimizer init, model.cuda() needs to be called before
+            print(" > Restoring Model.")
+            model.load_state_dict(checkpoint['model'])
             # optimizer restore
-            # optimizer.load_state_dict(checkpoint['optimizer'])
+            print(" > Restoring Optimizer.")
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            if "scaler" in checkpoint and c.mixed_precision:
+                print(" > Restoring AMP Scaler...")
+                scaler.load_state_dict(checkpoint["scaler"])
             if c.reinit_layers:
                 raise RuntimeError
-            model.load_state_dict(checkpoint['model'])
-        except KeyError:
+        except (KeyError, RuntimeError):
             print(" > Partial model initialization.")
             model_dict = model.state_dict()
             model_dict = set_init_dict(model_dict, checkpoint['model'], c)
@@ -545,9 +554,6 @@ def main(args):  # pylint: disable=redefined-outer-name
             # print("State Dict saved for debug in: ", os.path.join(OUT_PATH, 'state_dict.pt'))
             model.load_state_dict(model_dict)
             del model_dict
-
-        if amp and 'amp' in checkpoint:
-            amp.load_state_dict(checkpoint['amp'])
 
         for group in optimizer.param_groups:
             group['lr'] = c.lr
@@ -578,6 +584,13 @@ def main(args):  # pylint: disable=redefined-outer-name
     if 'best_loss' not in locals():
         best_loss = float('inf')
 
+    # define data loaders
+    train_loader = setup_loader(ap,
+                                model.decoder.r,
+                                is_val=False,
+                                verbose=True)
+    eval_loader = setup_loader(ap, model.decoder.r, is_val=True)
+
     global_step = args.restore_step
     for epoch in range(0, c.epochs):
         c_logger.print_epoch_start(epoch, c.epochs)
@@ -588,17 +601,40 @@ def main(args):  # pylint: disable=redefined-outer-name
             model.decoder.set_r(r)
             if c.bidirectional_decoder:
                 model.decoder_backward.set_r(r)
+            train_loader.dataset.outputs_per_step = r
+            eval_loader.dataset.outputs_per_step = r
+            train_loader = setup_loader(ap,
+                                        model.decoder.r,
+                                        is_val=False,
+                                        dataset=train_loader.dataset)
+            eval_loader = setup_loader(ap,
+                                       model.decoder.r,
+                                       is_val=True,
+                                       dataset=eval_loader.dataset)
             print("\n > Number of output frames:", model.decoder.r)
-        train_avg_loss_dict, global_step = train(model, criterion, optimizer,
+        # train one epoch
+        train_avg_loss_dict, global_step = train(train_loader, model,
+                                                 criterion, optimizer,
                                                  optimizer_st, scheduler, ap,
-                                                 global_step, epoch, amp, speaker_mapping)
-        eval_avg_loss_dict = evaluate(model, criterion, ap, global_step, epoch, speaker_mapping)
+                                                 global_step, epoch, scaler,
+                                                 scaler_st)
+        # eval one epoch
+        eval_avg_loss_dict = evaluate(eval_loader, model, criterion, ap,
+                                      global_step, epoch)
         c_logger.print_epoch_end(epoch, eval_avg_loss_dict)
         target_loss = train_avg_loss_dict['avg_postnet_loss']
         if c.run_eval:
             target_loss = eval_avg_loss_dict['avg_postnet_loss']
-        best_loss = save_best_model(target_loss, best_loss, model, optimizer, global_step, epoch, c.r,
-                                    OUT_PATH, amp_state_dict=amp.state_dict() if amp else None)
+        best_loss = save_best_model(
+            target_loss,
+            best_loss,
+            model,
+            optimizer,
+            global_step,
+            epoch,
+            c.r,
+            OUT_PATH,
+            scaler=scaler.state_dict() if c.mixed_precision else None)
 
 
 if __name__ == '__main__':
@@ -650,8 +686,8 @@ if __name__ == '__main__':
     check_config_tts(c)
     _ = os.path.dirname(os.path.realpath(__file__))
 
-    if c.apex_amp_level == 'O1':
-        print("   >  apex AMP level: ", c.apex_amp_level)
+    if c.mixed_precision:
+        print("   >  Mixed precision mode is ON")
 
     OUT_PATH = args.continue_path
     if args.continue_path == '':
@@ -667,8 +703,8 @@ if __name__ == '__main__':
         if args.restore_path:
             new_fields["restore_path"] = args.restore_path
         new_fields["github_branch"] = get_git_branch()
-        copy_config_file(args.config_path,
-                         os.path.join(OUT_PATH, 'config.json'), new_fields)
+        copy_model_files(c,  args.config_path,
+                         OUT_PATH, new_fields)
         os.chmod(AUDIO_PATH, 0o775)
         os.chmod(OUT_PATH, 0o775)
 
